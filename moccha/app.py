@@ -60,7 +60,7 @@ def create_app(api_key, workspace="/content"):
     @app.route('/')
     def home():
         return jsonify({
-            "service": "colab-server",
+            "service": "moccha",
             "version": "2.0.0",
             "status": "running",
             "uptime": str(datetime.now() - app.config['START_TIME']),
