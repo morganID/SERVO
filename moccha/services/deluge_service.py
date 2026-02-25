@@ -1,8 +1,10 @@
-"""Deluge Service - manajemen Deluge daemon dan torrent."""
+"""Deluge Service - manajemen Deluge daemon dan torrent - FIXED."""
 
 import os
+import sys
 import time
 import json
+import base64
 import logging
 import subprocess
 import threading
@@ -12,465 +14,638 @@ from pathlib import Path
 try:
     from deluge_client import DelugeRPCClient
 except ImportError:
-    raise ImportError("deluge-client not installed. Install with: pip install deluge-client")
+    raise ImportError("deluge-client not installed. Run: pip install deluge-client")
 
 logger = logging.getLogger(__name__)
 
 
 class DelugeService:
     """Service for managing Deluge daemon and torrents."""
-    
+
     def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize Deluge Service.
-        
-        Args:
-            config: Configuration dictionary with host, port, download_path, etc.
-        """
         self.config = config
-        self.host = config.get("host", "localhost")
-        self.port = config.get("port", 58846)
-        self.download_path = config.get("download_path", "/downloads/torrents")
-        self.max_download_speed = config.get("max_download_speed", 0)
-        self.max_upload_speed = config.get("max_upload_speed", 0)
-        self.auto_add_folder = config.get("auto_add_folder", "/torrents/watch")
-        
-        # Create download directory if it doesn't exist
+        self.host = config.get("host", "127.0.0.1")
+        self.daemon_port = config.get("port", 58846)
+        self.download_path = config.get("download_path", "/content/downloads")
+        self.max_download_speed = config.get("max_download_speed", -1)
+        self.max_upload_speed = config.get("max_upload_speed", -1)
+        self.auto_add_folder = config.get("auto_add_folder", "")
+
+        # ✅ FIX: Config directory untuk deluged
+        self.config_dir = config.get("config_dir",
+                                     os.path.expanduser("~/.config/deluge"))
+
+        # ✅ FIX: Auth credentials (harus match auth file)
+        self.username = config.get("username", "localclient")
+        self.password = config.get("password", "deluge123")
+
+        # Create directories
         os.makedirs(self.download_path, exist_ok=True)
-        os.makedirs(self.auto_add_folder, exist_ok=True)
-        
-        self.client = None
+        os.makedirs(self.config_dir, exist_ok=True)
+        if self.auto_add_folder:
+            os.makedirs(self.auto_add_folder, exist_ok=True)
+
+        self._client = None
         self.daemon_process = None
-        self.is_running = False
-        
+        self._is_running = False
+
+    # ─────────────────────────────────────────────
+    # Auth & Config Setup
+    # ─────────────────────────────────────────────
+
+    def _setup_auth(self):
+        """
+        ✅ FIX: Buat auth file yang WAJIB ada sebelum deluged jalan.
+        Format: username:password:level
+        Level 10 = Admin
+        """
+        auth_file = os.path.join(self.config_dir, "auth")
+
+        # Cek apakah user sudah ada di auth file
+        existing = ""
+        if os.path.exists(auth_file):
+            with open(auth_file, "r") as f:
+                existing = f.read()
+
+        if self.username not in existing:
+            with open(auth_file, "a") as f:
+                f.write(f"{self.username}:{self.password}:10\n")
+            logger.info(f"Auth entry added for '{self.username}'")
+
+        # Set permissions
+        os.chmod(auth_file, 0o600)
+
+    def _setup_config(self):
+        """Setup core.conf jika belum ada."""
+        core_conf = os.path.join(self.config_dir, "core.conf")
+
+        if not os.path.exists(core_conf):
+            config_data = {
+                "file": 1,
+                "format": 1,
+                "data": {
+                    "download_location": self.download_path,
+                    "move_completed_path": self.download_path,
+                    "daemon_port": self.daemon_port,
+                    "allow_remote": True,
+                    "max_download_speed": self.max_download_speed,
+                    "max_upload_speed": self.max_upload_speed,
+                }
+            }
+
+            with open(core_conf, "w") as f:
+                json.dump(config_data, f, indent=2)
+
+            logger.info(f"Core config created at {core_conf}")
+
+    # ─────────────────────────────────────────────
+    # Connection Management
+    # ─────────────────────────────────────────────
+
     def _connect(self) -> bool:
-        """Connect to Deluge daemon."""
-        try:
-            if not self.client:
-                self.client = DelugeRPCClient(self.host, self.port, "localclient", "")
-                self.client.connect()
-            return True
-        except Exception as e:
-            logger.error(f"Failed to connect to Deluge: {e}")
-            return False
-    
+        """✅ FIX: Connect dengan proper error handling dan reconnect."""
+        # Cek apakah connection masih hidup
+        if self._client:
+            try:
+                # Test connection
+                self._client.call('daemon.info')
+                return True
+            except Exception:
+                # Connection stale, reconnect
+                logger.debug("Stale connection, reconnecting...")
+                try:
+                    self._client.disconnect()
+                except:
+                    pass
+                self._client = None
+
+        # Buat koneksi baru
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                self._client = DelugeRPCClient(
+                    self.host,
+                    self.daemon_port,
+                    self.username,
+                    self.password
+                )
+                self._client.connect()
+
+                # Verify connection
+                version = self._client.call('daemon.info')
+                v = version.decode() if isinstance(version, bytes) else version
+                logger.info(f"Connected to Deluge {v}")
+                return True
+
+            except Exception as e:
+                logger.warning(
+                    f"Connection attempt {attempt}/{max_retries} failed: {e}"
+                )
+                self._client = None
+                if attempt < max_retries:
+                    time.sleep(2)
+
+        return False
+
     def _disconnect(self) -> None:
         """Disconnect from Deluge daemon."""
         try:
-            if self.client:
-                self.client.disconnect()
-                self.client = None
+            if self._client:
+                self._client.disconnect()
+        except:
+            pass
+        finally:
+            self._client = None
+
+    def _ensure_connected(self) -> bool:
+        """Helper: pastikan terhubung, return False jika gagal."""
+        if not self._is_running:
+            return False
+        return self._connect()
+
+    # ─────────────────────────────────────────────
+    # Helper: Decode bytes dari deluge_client
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    def _decode(value):
+        """
+        ✅ FIX: deluge_client mengembalikan bytes untuk keys dan values.
+        Fungsi ini decode secara recursive.
+        """
+        if isinstance(value, bytes):
+            return value.decode('utf-8', errors='replace')
+        elif isinstance(value, dict):
+            return {
+                DelugeService._decode(k): DelugeService._decode(v)
+                for k, v in value.items()
+            }
+        elif isinstance(value, (list, tuple)):
+            return [DelugeService._decode(item) for item in value]
+        return value
+
+    # ─────────────────────────────────────────────
+    # Daemon Start / Stop
+    # ─────────────────────────────────────────────
+
+    def _install_deluge(self) -> bool:
+        """Install Deluge jika belum ada."""
+        try:
+            result = subprocess.run(
+                ["deluged", "--version"],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                logger.info(f"Deluge already installed: {result.stdout.strip()}")
+                return True
+        except FileNotFoundError:
+            pass
+
+        logger.info("Installing Deluge...")
+        try:
+            subprocess.run(
+                ["apt-get", "update", "-qq"],
+                capture_output=True, check=True
+            )
+            subprocess.run(
+                ["apt-get", "install", "-y", "-qq",
+                 "deluged", "deluge-console", "python3-libtorrent"],
+                capture_output=True, check=True
+            )
+            logger.info("Deluge installed successfully")
+            return True
         except Exception as e:
-            logger.error(f"Error disconnecting from Deluge: {e}")
-    
+            logger.error(f"Failed to install Deluge: {e}")
+            return False
+
     def start(self) -> Dict[str, Any]:
         """Start Deluge daemon."""
-        if self.is_running:
-            return {"success": True, "message": "Deluge daemon already running"}
-        
+        if self._is_running and self._connect():
+            return {
+                "success": True,
+                "message": "Deluge daemon already running"
+            }
+
         try:
-            # Check if deluged is available, if not try to install
-            try:
-                subprocess.run(["deluged", "--version"], capture_output=True, check=True)
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                # Try to install Deluge
-                print("Installing Deluge...")
-                try:
-                    # Try apt-get first (Linux)
-                    subprocess.run(["apt-get", "update", "-qq"], check=True)
-                    subprocess.run(["apt-get", "install", "-y", "-qq", 
-                                  "deluge", "deluged", "deluge-web", "deluge-console", "python3-libtorrent"], 
-                                 check=True)
-                except:
-                    # Try pip install as fallback
-                    subprocess.run([sys.executable, "-m", "pip", "install", "deluge"], check=True)
-            
-            # Start deluged daemon
+            # 1. Install jika perlu
+            if not self._install_deluge():
+                return {
+                    "success": False,
+                    "error": "Failed to install Deluge"
+                }
+
+            # 2. Setup auth & config
+            self._setup_auth()
+            self._setup_config()
+
+            # 3. Kill proses lama yang mungkin masih nyangkut
+            subprocess.run(["killall", "deluged"],
+                           capture_output=True)
+            time.sleep(2)
+
+            # ✅ FIX: Command yang benar untuk deluged
+            # -d = do not daemonize (kita manage sendiri)
+            # -c = config directory
+            # -p = pidfile, BUKAN port (port dari config)
+            # -l = log file
+            cmd = [
+                "deluged",
+                "-d",                          # foreground mode
+                "-c", self.config_dir,         # config directory
+                "-l", "/tmp/deluged.log",      # log file
+                "-L", "info",                  # log level
+            ]
+
+            logger.info(f"Starting deluged: {' '.join(cmd)}")
+
             self.daemon_process = subprocess.Popen(
-                ["deluged", "-d", "-P", str(self.port)],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
             )
-            
-            # Wait a bit for daemon to start
-            time.sleep(3)
-            
-            # Try to connect
-            if self._connect():
-                self.is_running = True
-                
-                # Configure settings
-                self._configure_settings()
-                
-                return {
-                    "success": True,
-                    "message": "Deluge daemon started successfully",
-                    "pid": self.daemon_process.pid,
-                    "host": self.host,
-                    "port": self.port
-                }
-            else:
-                # If connection failed, kill the process
+
+            # 4. Tunggu daemon ready
+            logger.info("Waiting for daemon to start...")
+            connected = False
+            for i in range(10):
+                time.sleep(2)
+
+                # Cek proses masih hidup
+                if self.daemon_process.poll() is not None:
+                    _, stderr = self.daemon_process.communicate()
+                    err = stderr.decode() if stderr else "unknown error"
+                    logger.error(f"Daemon exited: {err}")
+
+                    # Cek log
+                    log_content = ""
+                    try:
+                        with open("/tmp/deluged.log") as f:
+                            log_content = f.read()[-500:]
+                    except:
+                        pass
+
+                    return {
+                        "success": False,
+                        "error": f"Daemon exited unexpectedly: {err}",
+                        "log": log_content
+                    }
+
+                # Coba connect
+                if self._connect():
+                    connected = True
+                    break
+
+                logger.debug(f"  Waiting... ({i+1}/10)")
+
+            if not connected:
+                # Kill dan report error
                 self.daemon_process.terminate()
                 self.daemon_process = None
-                return {"success": False, "error": "Failed to connect to Deluge daemon"}
-                
+                return {
+                    "success": False,
+                    "error": "Timeout: could not connect to daemon after 20s"
+                }
+
+            self._is_running = True
+
+            # 5. Configure settings via RPC
+            self._apply_settings()
+
+            return {
+                "success": True,
+                "message": "Deluge daemon started successfully",
+                "pid": self.daemon_process.pid,
+                "host": self.host,
+                "port": self.daemon_port,
+                "download_path": self.download_path
+            }
+
         except Exception as e:
-            logger.error(f"Failed to start Deluge daemon: {e}")
+            logger.error(f"Failed to start Deluge: {e}")
             return {"success": False, "error": str(e)}
-    
+
     def stop(self) -> Dict[str, Any]:
         """Stop Deluge daemon."""
-        if not self.is_running:
-            return {"success": True, "message": "Deluge daemon not running"}
-        
         try:
-            # Disconnect client
             self._disconnect()
-            
-            # Stop daemon process
+
             if self.daemon_process:
                 self.daemon_process.terminate()
-                self.daemon_process.wait(timeout=10)
+                try:
+                    self.daemon_process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.daemon_process.kill()
                 self.daemon_process = None
-            
-            self.is_running = False
+
+            # Juga kill semua proses deluged yang tersisa
+            subprocess.run(["killall", "deluged"], capture_output=True)
+
+            self._is_running = False
             return {"success": True, "message": "Deluge daemon stopped"}
-            
+
         except Exception as e:
-            logger.error(f"Failed to stop Deluge daemon: {e}")
+            logger.error(f"Failed to stop Deluge: {e}")
             return {"success": False, "error": str(e)}
-    
+
     def restart(self) -> Dict[str, Any]:
         """Restart Deluge daemon."""
-        stop_result = self.stop()
-        if not stop_result.get("success"):
-            return stop_result
-        
-        # Wait a bit before restarting
-        time.sleep(2)
-        
+        self.stop()
+        time.sleep(3)
         return self.start()
-    
-    def _configure_settings(self) -> None:
-        """Configure Deluge settings."""
+
+    def _apply_settings(self) -> None:
+        """✅ FIX: Apply settings via client.call(), bukan client.core."""
         try:
             if not self._connect():
                 return
-            
-            # Set download/upload speed limits
-            if self.max_download_speed > 0:
-                self.client.core.set_config({"max_download_speed": self.max_download_speed})
-            
-            if self.max_upload_speed > 0:
-                self.client.core.set_config({"max_upload_speed": self.max_upload_speed})
-            
-            # Set download location
-            self.client.core.set_config({"download_location": self.download_path})
-            
-            # Enable auto-add folder
-            self.client.core.set_config({
-                "autoadd_enable": True,
-                "autoadd_location": self.auto_add_folder
-            })
-            
+
+            config = {
+                b"download_location": self.download_path,
+                b"move_completed_path": self.download_path,
+            }
+
+            if self.max_download_speed != -1:
+                config[b"max_download_speed"] = float(self.max_download_speed)
+
+            if self.max_upload_speed != -1:
+                config[b"max_upload_speed"] = float(self.max_upload_speed)
+
+            self._client.call('core.set_config', config)
+            logger.info("Settings applied successfully")
+
         except Exception as e:
-            logger.error(f"Failed to configure Deluge settings: {e}")
-    
+            logger.error(f"Failed to apply settings: {e}")
+
+    # ─────────────────────────────────────────────
+    # Status
+    # ─────────────────────────────────────────────
+
     def get_status(self) -> Dict[str, Any]:
         """Get Deluge daemon status."""
         status = {
-            "running": self.is_running,
+            "running": self._is_running,
             "host": self.host,
-            "port": self.port,
+            "port": self.daemon_port,
             "download_path": self.download_path,
-            "auto_add_folder": self.auto_add_folder
+            "connected": False,
         }
-        
-        if self.is_running and self._connect():
+
+        if self._ensure_connected():
             try:
-                # Get daemon info
-                daemon_info = self.client.daemon.info()
-                status.update({
-                    "daemon_info": daemon_info,
-                    "connected": True
-                })
-                
-                # Get stats
-                stats = self.client.core.get_session_status([
-                    "upload_rate", "download_rate", "dht_nodes"
-                ])
-                status["stats"] = {
-                    "upload_rate": stats["upload_rate"],
-                    "download_rate": stats["download_rate"],
-                    "dht_nodes": stats["dht_nodes"]
-                }
-                
+                # ✅ FIX: Pakai client.call()
+                version = self._client.call('daemon.info')
+                status["version"] = self._decode(version)
+                status["connected"] = True
+
+                session_keys = [
+                    b'upload_rate', b'download_rate',
+                    b'dht_nodes', b'has_incoming_connections'
+                ]
+                stats = self._client.call(
+                    'core.get_session_status', session_keys
+                )
+                status["stats"] = self._decode(stats)
+
             except Exception as e:
-                logger.error(f"Failed to get Deluge status: {e}")
-                status["connected"] = False
+                logger.error(f"Failed to get status: {e}")
                 status["error"] = str(e)
-        else:
-            status["connected"] = False
-        
+
         return status
-    
-    def add_torrent(self, torrent_url: Optional[str] = None, torrent_file: Optional[str] = None) -> Dict[str, Any]:
-        """Add torrent to Deluge."""
-        if not self.is_running:
-            return {"success": False, "error": "Deluge daemon not running"}
-        
-        if not self._connect():
-            return {"success": False, "error": "Failed to connect to Deluge"}
-        
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get session statistics."""
+        if not self._ensure_connected():
+            return {"success": False, "error": "Not connected"}
+
         try:
-            if torrent_url:
-                # Add torrent from URL
-                torrent_id = self.client.core.add_torrent_uri(torrent_url, {})
+            keys = [
+                b'upload_rate', b'download_rate',
+                b'dht_nodes', b'num_peers',
+                b'payload_upload_rate', b'payload_download_rate',
+                b'total_upload', b'total_download',
+            ]
+            stats = self._client.call('core.get_session_status', keys)
+            return {
+                "success": True,
+                "stats": self._decode(stats)
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # ─────────────────────────────────────────────
+    # Torrent Operations
+    # ─────────────────────────────────────────────
+
+    def add_torrent(
+        self,
+        magnet: Optional[str] = None,
+        torrent_url: Optional[str] = None,
+        torrent_file: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Add torrent. Supports:
+        - magnet link
+        - .torrent URL
+        - .torrent file path
+        """
+        if not self._ensure_connected():
+            return {"success": False, "error": "Not connected to Deluge"}
+
+        options = {
+            "download_location": self.download_path,
+            "max_download_speed": self.max_download_speed,
+            "max_upload_speed": self.max_upload_speed,
+        }
+
+        try:
+            torrent_id = None
+
+            # ✅ FIX: Magnet link
+            if magnet:
+                torrent_id = self._client.call(
+                    'core.add_torrent_magnet',
+                    magnet,
+                    options
+                )
+
+            # ✅ FIX: URL (.torrent download URL)
+            elif torrent_url:
+                torrent_id = self._client.call(
+                    'core.add_torrent_url',
+                    torrent_url,
+                    options
+                )
+
+            # ✅ FIX: File - harus base64 encode
             elif torrent_file and os.path.exists(torrent_file):
-                # Add torrent from file
                 with open(torrent_file, 'rb') as f:
-                    torrent_data = f.read()
-                torrent_id = self.client.core.add_torrent_file(os.path.basename(torrent_file), torrent_data, {})
+                    file_data = base64.b64encode(f.read())
+
+                torrent_id = self._client.call(
+                    'core.add_torrent_file',
+                    os.path.basename(torrent_file),
+                    file_data,
+                    options
+                )
             else:
-                return {"success": False, "error": "No torrent URL or file provided"}
-            
+                return {
+                    "success": False,
+                    "error": "Provide magnet, torrent_url, or torrent_file"
+                }
+
+            if torrent_id is None:
+                return {
+                    "success": False,
+                    "error": "Torrent already exists or invalid"
+                }
+
+            tid = self._decode(torrent_id)
+            logger.info(f"Torrent added: {tid}")
+
             return {
                 "success": True,
                 "message": "Torrent added successfully",
-                "torrent_id": str(torrent_id)
+                "torrent_id": tid
             }
-            
+
         except Exception as e:
             logger.error(f"Failed to add torrent: {e}")
             return {"success": False, "error": str(e)}
-    
+
     def list_torrents(self) -> Dict[str, Any]:
-        """List all torrents."""
-        if not self.is_running:
-            return {"success": False, "error": "Deluge daemon not running"}
-        
-        if not self._connect():
-            return {"success": False, "error": "Failed to connect to Deluge"}
-        
+        """List all torrents with status."""
+        if not self._ensure_connected():
+            return {"success": False, "error": "Not connected to Deluge"}
+
         try:
-            # Get all torrents
-            torrents = self.client.core.get_torrents_status({}, [
-                "name", "progress", "state", "download_payload_rate", 
-                "upload_payload_rate", "num_seeds", "num_peers",
-                "total_wanted", "total_done", "eta", "ratio"
-            ])
-            
-            # Format results
-            result = []
-            for torrent_id, torrent_info in torrents.items():
-                result.append({
-                    "id": str(torrent_id),
-                    "name": torrent_info["name"],
-                    "progress": torrent_info["progress"],
-                    "state": torrent_info["state"],
-                    "download_rate": torrent_info["download_payload_rate"],
-                    "upload_rate": torrent_info["upload_payload_rate"],
-                    "seeds": torrent_info["num_seeds"],
-                    "peers": torrent_info["num_peers"],
-                    "total_wanted": torrent_info["total_wanted"],
-                    "total_done": torrent_info["total_done"],
-                    "eta": torrent_info["eta"],
-                    "ratio": torrent_info["ratio"]
-                })
-            
+            # ✅ FIX: Pakai client.call() dengan field list
+            fields = [
+                'name', 'state', 'progress',
+                'download_payload_rate', 'upload_payload_rate',
+                'num_seeds', 'num_peers',
+                'total_wanted', 'total_done',
+                'eta', 'ratio', 'save_path'
+            ]
+
+            raw = self._client.call(
+                'core.get_torrents_status', {}, fields
+            )
+
+            torrents = []
+            for torrent_id, info in raw.items():
+                decoded = self._decode(info)
+                decoded['id'] = self._decode(torrent_id)
+                torrents.append(decoded)
+
             return {
                 "success": True,
-                "torrents": result,
-                "count": len(result)
+                "torrents": torrents,
+                "count": len(torrents)
             }
-            
+
         except Exception as e:
             logger.error(f"Failed to list torrents: {e}")
             return {"success": False, "error": str(e)}
-    
+
     def get_torrent_details(self, torrent_id: str) -> Dict[str, Any]:
         """Get detailed information about a specific torrent."""
-        if not self.is_running:
-            return {"success": False, "error": "Deluge daemon not running"}
-        
-        if not self._connect():
-            return {"success": False, "error": "Failed to connect to Deluge"}
-        
+        if not self._ensure_connected():
+            return {"success": False, "error": "Not connected to Deluge"}
+
         try:
-            # Get torrent status
-            torrent_info = self.client.core.get_torrent_status(torrent_id, [
-                "name", "progress", "state", "download_payload_rate", 
-                "upload_payload_rate", "num_seeds", "num_peers",
-                "total_wanted", "total_done", "eta", "ratio",
-                "files", "trackers", "peers"
-            ])
-            
-            if not torrent_info:
+            fields = [
+                'name', 'state', 'progress',
+                'download_payload_rate', 'upload_payload_rate',
+                'num_seeds', 'num_peers',
+                'total_wanted', 'total_done',
+                'eta', 'ratio', 'save_path',
+                'files', 'trackers', 'peers',
+                'total_size', 'hash', 'message',
+                'tracker_host', 'time_added'
+            ]
+
+            # ✅ FIX: client.call()
+            raw = self._client.call(
+                'core.get_torrent_status', torrent_id, fields
+            )
+
+            if not raw:
                 return {"success": False, "error": "Torrent not found"}
-            
-            # Format files
-            files = []
-            if "files" in torrent_info:
-                for i, file_info in enumerate(torrent_info["files"]):
-                    files.append({
-                        "index": i,
-                        "path": file_info["path"],
-                        "size": file_info["size"],
-                        "offset": file_info["offset"]
-                    })
-            
-            # Format trackers
-            trackers = []
-            if "trackers" in torrent_info:
-                for tracker in torrent_info["trackers"]:
-                    trackers.append({
-                        "url": tracker["url"],
-                        "tier": tracker["tier"]
-                    })
-            
-            # Format peers
-            peers = []
-            if "peers" in torrent_info:
-                for peer_id, peer_info in torrent_info["peers"].items():
-                    peers.append({
-                        "peer_id": peer_id,
-                        "ip": peer_info["ip"],
-                        "progress": peer_info["progress"],
-                        "down_speed": peer_info["down_speed"],
-                        "up_speed": peer_info["up_speed"]
-                    })
-            
-            result = {
-                "id": torrent_id,
-                "name": torrent_info["name"],
-                "progress": torrent_info["progress"],
-                "state": torrent_info["state"],
-                "download_rate": torrent_info["download_payload_rate"],
-                "upload_rate": torrent_info["upload_payload_rate"],
-                "seeds": torrent_info["num_seeds"],
-                "peers": torrent_info["num_peers"],
-                "total_wanted": torrent_info["total_wanted"],
-                "total_done": torrent_info["total_done"],
-                "eta": torrent_info["eta"],
-                "ratio": torrent_info["ratio"],
-                "files": files,
-                "trackers": trackers,
-                "peers": peers
-            }
-            
+
+            result = self._decode(raw)
+            result['id'] = torrent_id
+
             return {"success": True, "torrent": result}
-            
+
         except Exception as e:
             logger.error(f"Failed to get torrent details: {e}")
             return {"success": False, "error": str(e)}
-    
+
     def pause_torrent(self, torrent_id: str) -> Dict[str, Any]:
-        """Pause a specific torrent."""
-        if not self.is_running:
-            return {"success": False, "error": "Deluge daemon not running"}
-        
-        if not self._connect():
-            return {"success": False, "error": "Failed to connect to Deluge"}
-        
+        """Pause a torrent."""
+        if not self._ensure_connected():
+            return {"success": False, "error": "Not connected"}
+
         try:
-            self.client.core.pause_torrent([torrent_id])
-            return {"success": True, "message": f"Torrent {torrent_id} paused"}
+            # ✅ FIX: client.call()
+            self._client.call('core.pause_torrent', [torrent_id])
+            return {
+                "success": True,
+                "message": f"Torrent {torrent_id} paused"
+            }
         except Exception as e:
-            logger.error(f"Failed to pause torrent: {e}")
             return {"success": False, "error": str(e)}
-    
+
     def resume_torrent(self, torrent_id: str) -> Dict[str, Any]:
-        """Resume a specific torrent."""
-        if not self.is_running:
-            return {"success": False, "error": "Deluge daemon not running"}
-        
-        if not self._connect():
-            return {"success": False, "error": "Failed to connect to Deluge"}
-        
+        """Resume a torrent."""
+        if not self._ensure_connected():
+            return {"success": False, "error": "Not connected"}
+
         try:
-            self.client.core.resume_torrent([torrent_id])
-            return {"success": True, "message": f"Torrent {torrent_id} resumed"}
-        except Exception as e:
-            logger.error(f"Failed to resume torrent: {e}")
-            return {"success": False, "error": str(e)}
-    
-    def remove_torrent(self, torrent_id: str, remove_data: bool = False) -> Dict[str, Any]:
-        """Remove a specific torrent."""
-        if not self.is_running:
-            return {"success": False, "error": "Deluge daemon not running"}
-        
-        if not self._connect():
-            return {"success": False, "error": "Failed to connect to Deluge"}
-        
-        try:
-            self.client.core.remove_torrent(torrent_id, remove_data)
-            return {"success": True, "message": f"Torrent {torrent_id} removed"}
-        except Exception as e:
-            logger.error(f"Failed to remove torrent: {e}")
-            return {"success": False, "error": str(e)}
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get Deluge statistics."""
-        if not self.is_running:
-            return {"success": False, "error": "Deluge daemon not running"}
-        
-        if not self._connect():
-            return {"success": False, "error": "Failed to connect to Deluge"}
-        
-        try:
-            stats = self.client.core.get_session_status([
-                "upload_rate", "download_rate", "dht_nodes",
-                "num_peers", "num_connections", "payload_upload_rate",
-                "payload_download_rate"
-            ])
-            
+            self._client.call('core.resume_torrent', [torrent_id])
             return {
                 "success": True,
-                "stats": {
-                    "upload_rate": stats["upload_rate"],
-                    "download_rate": stats["download_rate"],
-                    "dht_nodes": stats["dht_nodes"],
-                    "num_peers": stats["num_peers"],
-                    "num_connections": stats["num_connections"],
-                    "payload_upload_rate": stats["payload_upload_rate"],
-                    "payload_download_rate": stats["payload_download_rate"]
-                }
+                "message": f"Torrent {torrent_id} resumed"
             }
-            
         except Exception as e:
-            logger.error(f"Failed to get Deluge stats: {e}")
             return {"success": False, "error": str(e)}
-    
-    def get_peers(self, torrent_id: str) -> Dict[str, Any]:
-        """Get peer information for a specific torrent."""
-        if not self.is_running:
-            return {"success": False, "error": "Deluge daemon not running"}
-        
-        if not self._connect():
-            return {"success": False, "error": "Failed to connect to Deluge"}
-        
+
+    def remove_torrent(
+        self, torrent_id: str, remove_data: bool = False
+    ) -> Dict[str, Any]:
+        """Remove a torrent."""
+        if not self._ensure_connected():
+            return {"success": False, "error": "Not connected"}
+
         try:
-            peers = self.client.core.get_torrent_status(torrent_id, ["peers"])
-            
-            peer_list = []
-            if "peers" in peers:
-                for peer_id, peer_info in peers["peers"].items():
-                    peer_list.append({
-                        "peer_id": peer_id,
-                        "ip": peer_info["ip"],
-                        "progress": peer_info["progress"],
-                        "down_speed": peer_info["down_speed"],
-                        "up_speed": peer_info["up_speed"],
-                        "client": peer_info["client"]
-                    })
-            
+            self._client.call(
+                'core.remove_torrent', torrent_id, remove_data
+            )
             return {
                 "success": True,
-                "peers": peer_list,
-                "count": len(peer_list)
+                "message": f"Torrent {torrent_id} removed"
             }
-            
         except Exception as e:
-            logger.error(f"Failed to get peers: {e}")
+            return {"success": False, "error": str(e)}
+
+    def pause_all(self) -> Dict[str, Any]:
+        """Pause all torrents."""
+        if not self._ensure_connected():
+            return {"success": False, "error": "Not connected"}
+
+        try:
+            self._client.call('core.pause_all_torrents')
+            return {"success": True, "message": "All torrents paused"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def resume_all(self) -> Dict[str, Any]:
+        """Resume all torrents."""
+        if not self._ensure_connected():
+            return {"success": False, "error": "Not connected"}
+
+        try:
+            self._client.call('core.resume_all_torrents')
+            return {"success": True, "message": "All torrents resumed"}
+        except Exception as e:
             return {"success": False, "error": str(e)}

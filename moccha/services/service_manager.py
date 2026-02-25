@@ -8,16 +8,6 @@ from pathlib import Path
 
 from .deluge_service import DelugeService
 
-# Optional imports for future services
-try:
-    from .jdownloader_service import JDownloaderService
-except ImportError:
-    JDownloaderService = None
-
-try:
-    from .mega_service import MegaService
-except ImportError:
-    MegaService = None
 
 logger = logging.getLogger(__name__)
 
@@ -108,21 +98,6 @@ class ServiceManager:
             except Exception as e:
                 logger.error(f"Failed to initialize Deluge service: {e}")
         
-        # Initialize JDownloader service
-        if services_config.get("jdownloader", {}).get("enabled", False):
-            try:
-                self.services["jdownloader"] = JDownloaderService(services_config["jdownloader"])
-                logger.info("JDownloader service initialized")
-            except Exception as e:
-                logger.error(f"Failed to initialize JDownloader service: {e}")
-        
-        # Initialize MEGA service
-        if services_config.get("mega", {}).get("enabled", False):
-            try:
-                self.services["mega"] = MegaService(services_config["mega"])
-                logger.info("MEGA service initialized")
-            except Exception as e:
-                logger.error(f"Failed to initialize MEGA service: {e}")
     
     def get_service(self, service_name: str) -> Optional[Any]:
         """Get service instance by name."""
@@ -217,10 +192,6 @@ class ServiceManager:
                 # Reinitialize with new config
                 if service_name == "deluge":
                     self.services[service_name] = DelugeService(self.config["services"]["deluge"])
-                elif service_name == "jdownloader":
-                    self.services[service_name] = JDownloaderService(self.config["services"]["jdownloader"])
-                elif service_name == "mega":
-                    self.services[service_name] = MegaService(self.config["services"]["mega"])
                 
                 return {"success": True, "message": f"Configuration updated for {service_name}"}
             except Exception as e:
