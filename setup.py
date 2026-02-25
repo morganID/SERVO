@@ -11,6 +11,7 @@ setup(
         'pyngrok',
         'psutil',
         'requests',
+        'deluge-client',
     ],
     entry_points={
         'console_scripts': [

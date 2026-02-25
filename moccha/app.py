@@ -18,6 +18,9 @@ from functools import wraps
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 
+# Import services
+from .services.service_manager import ServiceManager
+
 
 def create_app(api_key, workspace="/content"):
     """Factory: bikin Flask app."""
@@ -296,5 +299,256 @@ def create_app(api_key, workspace="/content"):
     def history():
         n = int(request.args.get('limit', 20))
         return jsonify(app.config['HISTORY'][-n:])
+
+    # ── Services Routes ───────────────────────────────────
+    
+    @app.route('/services')
+    @require_key
+    def services_list():
+        """List all available services."""
+        try:
+            service_manager = ServiceManager()
+            services = service_manager.list_services()
+            return jsonify({
+                "success": True,
+                "services": services,
+                "count": len(services)
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/services/status')
+    @require_key
+    def services_status():
+        """Get status of all services."""
+        try:
+            service_manager = ServiceManager()
+            status = service_manager.get_all_services_status()
+            return jsonify({
+                "success": True,
+                "services": status
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/services/<service_name>/status')
+    @require_key
+    def service_status(service_name):
+        """Get status of a specific service."""
+        try:
+            service_manager = ServiceManager()
+            status = service_manager.get_service_status(service_name)
+            return jsonify(status)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/services/<service_name>/start', methods=['POST'])
+    @require_key
+    def service_start(service_name):
+        """Start a specific service."""
+        try:
+            service_manager = ServiceManager()
+            result = service_manager.start_service(service_name)
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/services/<service_name>/stop', methods=['POST'])
+    @require_key
+    def service_stop(service_name):
+        """Stop a specific service."""
+        try:
+            service_manager = ServiceManager()
+            result = service_manager.stop_service(service_name)
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/services/<service_name>/restart', methods=['POST'])
+    @require_key
+    def service_restart(service_name):
+        """Restart a specific service."""
+        try:
+            service_manager = ServiceManager()
+            result = service_manager.restart_service(service_name)
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/services/config')
+    @require_key
+    def services_config():
+        """Get configuration of all services."""
+        try:
+            service_manager = ServiceManager()
+            config = service_manager.get_config()
+            return jsonify({
+                "success": True,
+                "config": config
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/services/config/<service_name>')
+    @require_key
+    def service_config(service_name):
+        """Get configuration of a specific service."""
+        try:
+            service_manager = ServiceManager()
+            config = service_manager.get_config(service_name)
+            return jsonify({
+                "success": True,
+                "service": service_name,
+                "config": config
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/services/config', methods=['POST'])
+    @require_key
+    def update_services_config():
+        """Update configuration for a service."""
+        try:
+            data = request.json or {}
+            service_name = data.get('service_name')
+            config = data.get('config', {})
+            
+            if not service_name:
+                return jsonify({"error": "Service name required"}), 400
+            
+            service_manager = ServiceManager()
+            result = service_manager.update_config(service_name, config)
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    # ── Deluge Routes ─────────────────────────────────────
+    
+    @app.route('/services/deluge/torrents')
+    @require_key
+    def deluge_list_torrents():
+        """List all Deluge torrents."""
+        try:
+            service_manager = ServiceManager()
+            deluge_service = service_manager.get_service("deluge")
+            if not deluge_service:
+                return jsonify({"error": "Deluge service not found or not enabled"}), 404
+            
+            result = deluge_service.list_torrents()
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/services/deluge/torrents', methods=['POST'])
+    @require_key
+    def deluge_add_torrent():
+        """Add torrent to Deluge."""
+        try:
+            data = request.json or {}
+            torrent_url = data.get('torrent_url')
+            torrent_file = data.get('torrent_file')
+            
+            service_manager = ServiceManager()
+            deluge_service = service_manager.get_service("deluge")
+            if not deluge_service:
+                return jsonify({"error": "Deluge service not found or not enabled"}), 404
+            
+            result = deluge_service.add_torrent(torrent_url, torrent_file)
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/services/deluge/torrents/<torrent_id>')
+    @require_key
+    def deluge_get_torrent(torrent_id):
+        """Get detailed information about a specific torrent."""
+        try:
+            service_manager = ServiceManager()
+            deluge_service = service_manager.get_service("deluge")
+            if not deluge_service:
+                return jsonify({"error": "Deluge service not found or not enabled"}), 404
+            
+            result = deluge_service.get_torrent_details(torrent_id)
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/services/deluge/torrents/<torrent_id>/pause', methods=['POST'])
+    @require_key
+    def deluge_pause_torrent(torrent_id):
+        """Pause a specific torrent."""
+        try:
+            service_manager = ServiceManager()
+            deluge_service = service_manager.get_service("deluge")
+            if not deluge_service:
+                return jsonify({"error": "Deluge service not found or not enabled"}), 404
+            
+            result = deluge_service.pause_torrent(torrent_id)
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/services/deluge/torrents/<torrent_id>/resume', methods=['POST'])
+    @require_key
+    def deluge_resume_torrent(torrent_id):
+        """Resume a specific torrent."""
+        try:
+            service_manager = ServiceManager()
+            deluge_service = service_manager.get_service("deluge")
+            if not deluge_service:
+                return jsonify({"error": "Deluge service not found or not enabled"}), 404
+            
+            result = deluge_service.resume_torrent(torrent_id)
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/services/deluge/torrents/<torrent_id>/remove', methods=['POST'])
+    @require_key
+    def deluge_remove_torrent(torrent_id):
+        """Remove a specific torrent."""
+        try:
+            data = request.json or {}
+            remove_data = data.get('remove_data', False)
+            
+            service_manager = ServiceManager()
+            deluge_service = service_manager.get_service("deluge")
+            if not deluge_service:
+                return jsonify({"error": "Deluge service not found or not enabled"}), 404
+            
+            result = deluge_service.remove_torrent(torrent_id, remove_data)
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/services/deluge/stats')
+    @require_key
+    def deluge_stats():
+        """Get Deluge statistics."""
+        try:
+            service_manager = ServiceManager()
+            deluge_service = service_manager.get_service("deluge")
+            if not deluge_service:
+                return jsonify({"error": "Deluge service not found or not enabled"}), 404
+            
+            result = deluge_service.get_stats()
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/services/deluge/peers/<torrent_id>')
+    @require_key
+    def deluge_get_peers(torrent_id):
+        """Get peer information for a specific torrent."""
+        try:
+            service_manager = ServiceManager()
+            deluge_service = service_manager.get_service("deluge")
+            if not deluge_service:
+                return jsonify({"error": "Deluge service not found or not enabled"}), 404
+            
+            result = deluge_service.get_peers(torrent_id)
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     return app
