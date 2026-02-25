@@ -16,8 +16,38 @@ import uuid
 import argparse
 import subprocess
 import time
+import threading
 
 from .daemon import PID_FILE, INFO_FILE, load_info, stop_daemon
+
+
+def _wait_and_print(timeout=30):
+    """Background thread: tunggu server ready lalu print info."""
+    for i in range(timeout):
+        time.sleep(1)
+        if os.path.exists(INFO_FILE):
+            break
+
+    info = load_info()
+    if info:
+        print()
+        print("=" * 55)
+        print("  ✅ SERVER RUNNING IN BACKGROUND!")
+        print("=" * 55)
+        print(f"  🌍 URL : {info['url']}")
+        print(f"  🔑 Key : {info['api_key']}")
+        print(f"  📍 Port: {info['port']}")
+        print(f"  📂 PID : {info['pid']}")
+        print("=" * 55)
+        print()
+        print("  📋 Quick test:")
+        print(f'  curl -H "X-API-Key: {info["api_key"]}" {info["url"]}/status')
+        print()
+        print("  🛑 Stop:  moccha stop")
+        print("  ℹ️  Info:  moccha info")
+        print()
+    else:
+        print("\n❌ Server gagal start. Cek log: cat /tmp/moccha.log")
 
 
 def main():
@@ -31,8 +61,13 @@ def main():
     p_start = sub.add_parser('start', help='Start server di background')
     p_start.add_argument('--port', type=int, default=5000)
     p_start.add_argument('--token', required=True, help='Ngrok auth token')
-    p_start.add_argument('--key', default=None, help='Custom API key (auto-generate jika kosong)')
+    p_start.add_argument('--key', default=None,
+                         help='Custom API key (auto-generate jika kosong)')
     p_start.add_argument('--workspace', default='/content')
+    p_start.add_argument(
+        '--wait', action='store_true', default=False,
+        help='Blocking: tunggu sampai server ready baru return'
+    )
 
     # ── stop ──────────────────────────────────────────────
     sub.add_parser('stop', help='Stop server')
@@ -49,6 +84,7 @@ def main():
     p_restart.add_argument('--token', required=True)
     p_restart.add_argument('--key', default=None)
     p_restart.add_argument('--workspace', default='/content')
+    p_restart.add_argument('--wait', action='store_true', default=False)
 
     args = parser.parse_args()
 
@@ -66,18 +102,17 @@ def main():
                 print(f"   URL: {info.get('url')}")
                 print(f"   Key: {info.get('api_key')}")
                 print(f"   Gunakan 'moccha stop' dulu kalau mau restart.")
-                sys.exit(0)
+                return                          # ← bukan sys.exit agar non-blocking
 
         api_key = args.key or str(uuid.uuid4())
 
         print("🚀 Starting server di background...")
 
-        # Jalankan daemon sebagai subprocess dengan nohup
-        # Ini yang bikin dia jalan di background!
+        # ── Spawn daemon subprocess (detached) ────────────
         cmd = [
             sys.executable, '-c',
             f"""
-import sys
+import sys, os
 sys.path.insert(0, '{os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}')
 from moccha.daemon import run_daemon
 run_daemon(
@@ -89,46 +124,30 @@ run_daemon(
 """
         ]
 
-        # Start sebagai background process (detached)
         log_file = open('/tmp/moccha.log', 'w')
-        proc = subprocess.Popen(
+        subprocess.Popen(
             cmd,
             stdout=log_file,
             stderr=log_file,
-            start_new_session=True,  # Detach dari parent
+            start_new_session=True,             # detach dari parent
         )
 
-        # Tunggu sampai info file muncul
-        print("   ⏳ Waiting for server...", end="", flush=True)
-        for i in range(30):
-            time.sleep(1)
-            print(".", end="", flush=True)
-            if os.path.exists(INFO_FILE):
-                break
-
-        print()
-
-        info = load_info()
-        if info:
-            print()
-            print("=" * 55)
-            print("  ✅ SERVER RUNNING IN BACKGROUND!")
-            print("=" * 55)
-            print(f"  🌍 URL : {info['url']}")
-            print(f"  🔑 Key : {info['api_key']}")
-            print(f"  📍 Port: {info['port']}")
-            print(f"  📂 PID : {info['pid']}")
-            print("=" * 55)
-            print()
-            print("  📋 Quick test:")
-            print(f'  curl -H "X-API-Key: {info["api_key"]}" {info["url"]}/status')
-            print()
-            print("  🛑 Stop:  moccha stop")
-            print("  ℹ️  Info:  moccha info")
-            print()
+        # ── Non-blocking vs blocking ─────────────────────
+        if args.wait:
+            # Kalau user minta --wait, blocking di sini
+            _wait_and_print(timeout=30)
         else:
-            print("❌ Server gagal start. Cek log: cat /tmp/moccha.log")
-            sys.exit(1)
+            # DEFAULT: non-blocking!
+            # Spawn daemon thread → print nanti, main() langsung return
+            t = threading.Thread(target=_wait_and_print, args=(30,), daemon=True)
+            t.start()
+
+            print("   ✅ Daemon spawned! Server starting di background.")
+            print("   📋 Cek nanti:  moccha info")
+            print("   🛑 Stop:       moccha stop")
+            print()
+            # main() langsung return → cell / shell langsung bebas
+            return
 
     # ══════════════════════════════════════════════════════
     elif args.command == 'stop':
@@ -142,7 +161,6 @@ run_daemon(
     elif args.command == 'status':
         info = load_info()
         if info and os.path.exists(PID_FILE):
-            # Verify pid masih hidup
             try:
                 pid = info['pid']
                 os.kill(pid, 0)
@@ -166,7 +184,6 @@ run_daemon(
         print("🔄 Restarting...")
         stop_daemon()
         time.sleep(2)
-        # Re-invoke start
         os.execvp(sys.executable, [
             sys.executable, '-m', 'moccha.cli',
             'start',
