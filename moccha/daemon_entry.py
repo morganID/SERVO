@@ -1,6 +1,6 @@
 """
 Daemon entry point - dipanggil oleh CLI sebagai subprocess.
-File terpisah supaya bisa di-run dengan: python -m moccha.daemon_entry
+Run with: python -m moccha.daemon_entry
 """
 
 import argparse
@@ -14,8 +14,7 @@ def main():
     parser.add_argument("--workspace", type=str, required=True)
     args = parser.parse_args()
 
-    # Import dan jalankan daemon
-    from .daemon import run_daemon
+    from moccha.daemon import run_daemon
 
     run_daemon(
         port=args.port,

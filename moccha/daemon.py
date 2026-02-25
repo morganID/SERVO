@@ -1,215 +1,203 @@
-"""CLI entry point - updated for cloudflared."""
+"""
+Background daemon - pakai cloudflared tunnel.
+"""
 
 import os
 import sys
-import json
 import time
+import json
 import signal
-import argparse
+import threading
 import subprocess
-import secrets
+import requests as req
+from datetime import datetime
 
-from .daemon import (
-    run_daemon, stop_daemon, is_running,
-    load_info, PID_FILE, INFO_FILE, LOG_FILE
-)
-
-
-def generate_api_key():
-    return secrets.token_hex(16)
+PID_FILE = "/tmp/moccha.pid"
+INFO_FILE = "/tmp/moccha.json"
+LOG_FILE = "/tmp/moccha.log"
 
 
-def cmd_start(args):
-    """Start the server."""
-    if is_running():
-        info = load_info()
-        if info:
-            print(f"🟢 Already running (PID: {info.get('pid')})")
-            print(f"   URL: {info.get('url')}")
-            print(f"   Key: {info.get('api_key')}")
-            return
-        print("⚠️ PID file exists but server may be dead. Cleaning up...")
+def log(msg):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    line = f"[{timestamp}] {msg}"
+    print(line, file=sys.stderr)
+    try:
+        with open(LOG_FILE, 'a') as f:
+            f.write(line + "\n")
+    except:
+        pass
+
+
+def save_info(data):
+    with open(INFO_FILE, 'w') as f:
+        json.dump(data, f)
+
+
+def load_info():
+    try:
+        with open(INFO_FILE) as f:
+            return json.load(f)
+    except:
+        return None
+
+
+def is_running():
+    if not os.path.exists(PID_FILE):
+        return False
+    try:
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, ValueError, OSError, PermissionError):
         try:
             os.remove(PID_FILE)
         except:
             pass
+        return False
 
-    port = args.port or 5000
-    api_key = args.api_key or generate_api_key()
-    workspace = args.workspace or os.path.expanduser("~/moccha_workspace")
 
-    os.makedirs(workspace, exist_ok=True)
+def wait_for_flask(port, timeout=15):
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            r = req.get(f"http://127.0.0.1:{port}/ping", timeout=2)
+            if r.status_code == 200:
+                return True
+        except:
+            pass
+        time.sleep(0.5)
+    return False
 
-    print(f"🚀 Starting server...")
-    print(f"   Port: {port}")
-    print(f"   Workspace: {workspace}")
-    print(f"   Tunnel: cloudflared (free, no token needed)")
 
-    # ✅ Tidak perlu ngrok token lagi!
-    # Jalankan daemon di background
-    env = os.environ.copy()
+def run_daemon(port, api_key=None, workspace=None):
+    """Jalankan server sebagai daemon process."""
+    # Import DISINI, bukan di top-level (avoid circular)
+    from moccha.app import create_app
+    from moccha.tunnel import start_tunnel, stop_tunnel, is_tunnel_alive
 
-    # Redirect stderr ke log file
-    log_f = open(LOG_FILE, 'a')
+    with open(PID_FILE, 'w') as f:
+        f.write(str(os.getpid()))
 
-    proc = subprocess.Popen(
-        [
-            sys.executable, "-m", "moccha.daemon_entry",
-            "--port", str(port),
-            "--api-key", api_key,
-            "--workspace", workspace,
-        ],
-        stdout=subprocess.PIPE,
-        stderr=log_f,
-        env=env,
-        start_new_session=True,
+    log(f"🚀 Daemon starting (PID: {os.getpid()})")
+    log(f"   Port: {port}")
+    log(f"   Workspace: {workspace}")
+
+    # ── 1) Start Flask ────────────────────────────────────
+    app = create_app(api_key=api_key, workspace=workspace)
+
+    flask_thread = threading.Thread(
+        target=lambda: app.run(host='0.0.0.0', port=port, use_reloader=False),
+        daemon=True
     )
+    flask_thread.start()
 
-    # Tunggu info file muncul
-    print("⏳ Waiting for server to start...")
+    log("⏳ Waiting for Flask...")
+    if wait_for_flask(port, timeout=15):
+        log("✅ Flask is ready")
+    else:
+        log("⚠️ Flask may not be ready, continuing...")
 
-    for i in range(30):
+    # ── 2) Start Cloudflared Tunnel ───────────────────────
+    public_url = f"http://localhost:{port}"
+
+    log("📡 Starting cloudflared tunnel...")
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            public_url = start_tunnel(port)
+            log(f"✅ Tunnel active: {public_url}")
+            break
+        except Exception as e:
+            log(f"❌ Tunnel attempt {attempt}/{max_retries}: {e}")
+            if attempt < max_retries:
+                log("   Retrying in 3s...")
+                time.sleep(3)
+            else:
+                log(f"❌ All tunnel attempts failed")
+                log(f"⚠️ Fallback: {public_url}")
+
+    # ── 3) Save info ─────────────────────────────────────
+    info = {
+        "pid": os.getpid(),
+        "port": port,
+        "api_key": api_key,
+        "url": public_url,
+        "tunnel": "cloudflared",
+        "started": datetime.now().isoformat(),
+        "workspace": workspace,
+    }
+    save_info(info)
+
+    print(json.dumps(info))
+    sys.stdout.flush()
+    log(f"🌐 URL: {public_url}")
+
+    # ── 4) Keep-alive + tunnel monitor ────────────────────
+    def keepalive():
+        while True:
+            try:
+                req.get(f'http://localhost:{port}/ping', timeout=5)
+            except:
+                pass
+
+            if not is_tunnel_alive():
+                log("⚠️ Tunnel died, restarting...")
+                try:
+                    new_url = start_tunnel(port)
+                    log(f"✅ Tunnel restarted: {new_url}")
+                    current_info = load_info() or info
+                    current_info["url"] = new_url
+                    save_info(current_info)
+                except Exception as e:
+                    log(f"❌ Tunnel restart failed: {e}")
+
+            time.sleep(30)
+
+    threading.Thread(target=keepalive, daemon=True).start()
+
+    # ── 5) Handle SIGTERM ─────────────────────────────────
+    def handle_stop(signum, frame):
+        log("🛑 Stopping daemon...")
+        stop_tunnel()
+        for fpath in [PID_FILE, INFO_FILE]:
+            try:
+                os.remove(fpath)
+            except:
+                pass
+        log("👋 Daemon stopped")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_stop)
+    signal.signal(signal.SIGINT, handle_stop)
+
+    # ── 6) Block forever ──────────────────────────────────
+    try:
+        while True:
+            time.sleep(60)
+    except (KeyboardInterrupt, SystemExit):
+        handle_stop(None, None)
+
+
+def stop_daemon():
+    if not os.path.exists(PID_FILE):
+        return False
+
+    try:
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGTERM)
         time.sleep(2)
-        info = load_info()
-        if info and info.get("url"):
-            url = info["url"]
-            print(f"\n{'='*55}")
-            print(f"  🟢 Server is running!")
-            print(f"  🌐 URL: {url}")
-            print(f"  🔑 Key: {api_key}")
-            print(f"  📂 Workspace: {workspace}")
-            print(f"  🔧 Tunnel: cloudflared")
-            print(f"{'='*55}")
+    except:
+        pass
 
-            if "localhost" in url:
-                print(f"\n  ⚠️ Tunnel belum aktif, cek log:")
-                print(f"     cat {LOG_FILE}")
-
-            return
-
-    # Timeout
-    print(f"\n⚠️ Server mungkin jalan tapi tunnel belum ready")
-    print(f"   Cek log: cat {LOG_FILE}")
-    print(f"   Cek status: moccha status")
-
-
-def cmd_stop(args):
-    """Stop the server."""
-    if not is_running():
-        print("🔴 Server is not running")
-        return
-
-    info = load_info()
-    if stop_daemon():
-        print("🛑 Server stopped")
-    else:
-        print("⚠️ Failed to stop server cleanly")
-        # Force kill
-        subprocess.run(["killall", "cloudflared"], capture_output=True)
+    for fpath in [PID_FILE, INFO_FILE]:
         try:
-            os.remove(PID_FILE)
-            os.remove(INFO_FILE)
+            os.remove(fpath)
         except:
             pass
-        print("🧹 Cleaned up")
 
+    from moccha.tunnel import stop_tunnel
+    stop_tunnel()
 
-def cmd_status(args):
-    """Show server status."""
-    if is_running():
-        info = load_info()
-        if info:
-            print(f"🟢 RUNNING (PID: {info.get('pid')})")
-            print(f"   URL: {info.get('url')}")
-            print(f"   Key: {info.get('api_key')}")
-            print(f"   Tunnel: {info.get('tunnel', 'unknown')}")
-            print(f"   Started: {info.get('started')}")
-            print(f"   Workspace: {info.get('workspace')}")
-        else:
-            print("🟡 Process running but no info file")
-    else:
-        print("🔴 NOT RUNNING")
-
-
-def cmd_restart(args):
-    """Restart the server."""
-    print("🔄 Restarting...")
-    cmd_stop(args)
-    time.sleep(3)
-    cmd_start(args)
-
-
-def cmd_logs(args):
-    """Show logs."""
-    if os.path.exists(LOG_FILE):
-        lines = args.lines or 50
-        result = subprocess.run(
-            ["tail", "-n", str(lines), LOG_FILE],
-            capture_output=True, text=True
-        )
-        print(result.stdout)
-    else:
-        print("No log file found")
-
-
-def cmd_url(args):
-    """Show current URL."""
-    info = load_info()
-    if info and info.get("url"):
-        print(info["url"])
-    else:
-        print("No URL available. Server may not be running.")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        prog="moccha",
-        description="Moccha Server Manager"
-    )
-    sub = parser.add_subparsers(dest="command")
-
-    # start
-    p_start = sub.add_parser("start", help="Start server")
-    p_start.add_argument("--port", type=int, default=5000)
-    p_start.add_argument("--api-key", type=str, default=None)
-    p_start.add_argument("--workspace", type=str, default=None)
-    # ✅ ngrok-token tetap ada tapi opsional & diabaikan
-    p_start.add_argument("--ngrok-token", type=str, default=None,
-                         help="(deprecated, ignored - using cloudflared)")
-    p_start.set_defaults(func=cmd_start)
-
-    # stop
-    p_stop = sub.add_parser("stop", help="Stop server")
-    p_stop.set_defaults(func=cmd_stop)
-
-    # status
-    p_status = sub.add_parser("status", help="Show status")
-    p_status.set_defaults(func=cmd_status)
-
-    # restart
-    p_restart = sub.add_parser("restart", help="Restart server")
-    p_restart.add_argument("--port", type=int, default=5000)
-    p_restart.add_argument("--api-key", type=str, default=None)
-    p_restart.add_argument("--workspace", type=str, default=None)
-    p_restart.set_defaults(func=cmd_restart)
-
-    # logs
-    p_logs = sub.add_parser("logs", help="Show logs")
-    p_logs.add_argument("-n", "--lines", type=int, default=50)
-    p_logs.set_defaults(func=cmd_logs)
-
-    # url
-    p_url = sub.add_parser("url", help="Show current URL")
-    p_url.set_defaults(func=cmd_url)
-
-    args = parser.parse_args()
-
-    if not args.command:
-        parser.print_help()
-        return
-
-    args.func(args)
-
-
-if __name__ == "__main__":
-    main()
+    return True
