@@ -69,10 +69,13 @@ def run_daemon(port, ngrok_token, api_key, workspace):
 
     # ── 2) Start ngrok ────────────────────────────────────
     public_url = "http://localhost:" + str(port)
+    print(f"📡 Attempting to connect ngrok on port {port}...", file=sys.stderr)
     try:
         public_url = start_ngrok(port, ngrok_token)
+        print(f"✅ Ngrok connection successful: {public_url}", file=sys.stderr)
     except Exception as e:
-        print(f"⚠️ Ngrok error: {e}", file=sys.stderr)
+        print(f"❌ Ngrok connection failed: {e}", file=sys.stderr)
+        print(f"⚠️  Falling back to local URL: {public_url}", file=sys.stderr)
 
     # ── 3) Simpan info ke file ────────────────────────────
     info = {
