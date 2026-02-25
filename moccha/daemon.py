@@ -1,220 +1,215 @@
-"""
-Background daemon - FIXED VERSION
-"""
+"""CLI entry point - updated for cloudflared."""
 
 import os
 import sys
-import time
 import json
+import time
 import signal
-import threading
+import argparse
 import subprocess
-from datetime import datetime
+import secrets
 
-PID_FILE = "/tmp/moccha.pid"
-INFO_FILE = "/tmp/moccha.json"
-LOG_FILE = "/tmp/moccha.log"
-
-
-def log(msg):
-    """Log ke file DAN stderr supaya bisa di-debug."""
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    line = f"[{timestamp}] {msg}"
-    print(line, file=sys.stderr)
-    try:
-        with open(LOG_FILE, 'a') as f:
-            f.write(line + "\n")
-    except:
-        pass
+from .daemon import (
+    run_daemon, stop_daemon, is_running,
+    load_info, PID_FILE, INFO_FILE, LOG_FILE
+)
 
 
-def save_info(data):
-    with open(INFO_FILE, 'w') as f:
-        json.dump(data, f)
+def generate_api_key():
+    return secrets.token_hex(16)
 
 
-def load_info():
-    try:
-        with open(INFO_FILE) as f:
-            return json.load(f)
-    except:
-        return None
-
-
-def is_running():
-    """Cek apakah server sudah jalan."""
-    if not os.path.exists(PID_FILE):
-        return False
-    try:
-        with open(PID_FILE) as f:
-            pid = int(f.read().strip())
-        os.kill(pid, 0)
-        return True
-    # ✅ FIX: ProcessError → ProcessLookupError
-    except (ProcessLookupError, ValueError, OSError, PermissionError):
-        # PID file ada tapi proses sudah mati, cleanup
+def cmd_start(args):
+    """Start the server."""
+    if is_running():
+        info = load_info()
+        if info:
+            print(f"🟢 Already running (PID: {info.get('pid')})")
+            print(f"   URL: {info.get('url')}")
+            print(f"   Key: {info.get('api_key')}")
+            return
+        print("⚠️ PID file exists but server may be dead. Cleaning up...")
         try:
             os.remove(PID_FILE)
         except:
             pass
-        return False
 
+    port = args.port or 5000
+    api_key = args.api_key or generate_api_key()
+    workspace = args.workspace or os.path.expanduser("~/moccha_workspace")
 
-def wait_for_flask(port, timeout=10):
-    """Tunggu sampai Flask benar-benar ready."""
-    import requests as req
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            r = req.get(f"http://127.0.0.1:{port}/ping", timeout=2)
-            if r.status_code == 200:
-                return True
-        except:
-            pass
-        time.sleep(0.5)
-    return False
+    os.makedirs(workspace, exist_ok=True)
 
+    print(f"🚀 Starting server...")
+    print(f"   Port: {port}")
+    print(f"   Workspace: {workspace}")
+    print(f"   Tunnel: cloudflared (free, no token needed)")
 
-def run_daemon(port, ngrok_token, api_key, workspace):
-    """
-    Jalankan server sebagai daemon process.
-    """
-    from .app import create_app
-    from .tunnel import start_ngrok
+    # ✅ Tidak perlu ngrok token lagi!
+    # Jalankan daemon di background
+    env = os.environ.copy()
 
-    # Simpan PID
-    with open(PID_FILE, 'w') as f:
-        f.write(str(os.getpid()))
+    # Redirect stderr ke log file
+    log_f = open(LOG_FILE, 'a')
 
-    log(f"🚀 Daemon starting (PID: {os.getpid()})")
-    log(f"   Port: {port}")
-    log(f"   Workspace: {workspace}")
-    log(f"   Ngrok token: {'SET (' + ngrok_token[:8] + '...)' if ngrok_token else 'NOT SET!'}")
-
-    # ── 1) Start Flask di thread ──────────────────────────
-    app = create_app(api_key=api_key, workspace=workspace)
-
-    flask_thread = threading.Thread(
-        target=lambda: app.run(host='0.0.0.0', port=port, use_reloader=False),
-        daemon=True
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-m", "moccha.daemon_entry",
+            "--port", str(port),
+            "--api-key", api_key,
+            "--workspace", workspace,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=log_f,
+        env=env,
+        start_new_session=True,
     )
-    flask_thread.start()
 
-    # ✅ FIX: Tunggu Flask benar-benar ready, bukan cuma sleep
-    log("⏳ Waiting for Flask to be ready...")
-    if wait_for_flask(port, timeout=15):
-        log("✅ Flask is ready!")
-    else:
-        log("⚠️  Flask might not be ready yet, continuing anyway...")
+    # Tunggu info file muncul
+    print("⏳ Waiting for server to start...")
 
-    # ── 2) Start ngrok ────────────────────────────────────
-    public_url = f"http://localhost:{port}"
-
-    if not ngrok_token:
-        log("❌ NGROK TOKEN IS EMPTY!")
-        log("   Set via: moccha start --ngrok-token YOUR_TOKEN")
-        log(f"   Fallback to: {public_url}")
-    else:
-        # ✅ FIX: Kill stale ngrok processes first
-        log("🔄 Killing any stale ngrok processes...")
-        subprocess.run(["killall", "ngrok"], capture_output=True)
+    for i in range(30):
         time.sleep(2)
+        info = load_info()
+        if info and info.get("url"):
+            url = info["url"]
+            print(f"\n{'='*55}")
+            print(f"  🟢 Server is running!")
+            print(f"  🌐 URL: {url}")
+            print(f"  🔑 Key: {api_key}")
+            print(f"  📂 Workspace: {workspace}")
+            print(f"  🔧 Tunnel: cloudflared")
+            print(f"{'='*55}")
 
-        # ✅ FIX: Retry logic
-        max_retries = 3
-        for attempt in range(1, max_retries + 1):
-            try:
-                log(f"📡 Ngrok attempt {attempt}/{max_retries}...")
-                public_url = start_ngrok(port, ngrok_token)
-                log(f"✅ Ngrok connected: {public_url}")
-                break
-            except Exception as e:
-                log(f"❌ Ngrok attempt {attempt} failed: {type(e).__name__}: {e}")
-                if attempt < max_retries:
-                    log(f"   Retrying in 3s...")
-                    # Kill ngrok lagi sebelum retry
-                    subprocess.run(["killall", "ngrok"], capture_output=True)
-                    time.sleep(3)
-                else:
-                    log(f"❌ All ngrok attempts failed!")
-                    log(f"⚠️  Fallback to: {public_url}")
+            if "localhost" in url:
+                print(f"\n  ⚠️ Tunnel belum aktif, cek log:")
+                print(f"     cat {LOG_FILE}")
 
-    # ── 3) Simpan info ke file ────────────────────────────
-    info = {
-        "pid": os.getpid(),
-        "port": port,
-        "api_key": api_key,
-        "url": public_url,
-        "started": datetime.now().isoformat(),
-        "workspace": workspace,
-        "ngrok_connected": not public_url.startswith("http://localhost"),
-    }
-    save_info(info)
+            return
 
-    # Print info ke stdout
-    print(json.dumps(info))
-    sys.stdout.flush()
-
-    log(f"📋 Server info saved to {INFO_FILE}")
-    log(f"🌐 URL: {public_url}")
-
-    # ── 4) Keep-alive loop ────────────────────────────────
-    import requests as req
-
-    def keepalive():
-        while True:
-            try:
-                req.get(f'http://localhost:{port}/ping', timeout=5)
-            except:
-                pass
-            time.sleep(30)
-
-    threading.Thread(target=keepalive, daemon=True).start()
-
-    # ── 5) Handle SIGTERM ─────────────────────────────────
-    def handle_stop(signum, frame):
-        log("🛑 Stopping daemon...")
-        from .tunnel import stop_ngrok
-        stop_ngrok()
-        for fpath in [PID_FILE, INFO_FILE]:
-            try:
-                os.remove(fpath)
-            except:
-                pass
-        log("👋 Daemon stopped")
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, handle_stop)
-    signal.signal(signal.SIGINT, handle_stop)
-
-    # ── 6) Block forever ──────────────────────────────────
-    try:
-        while True:
-            time.sleep(60)
-    except (KeyboardInterrupt, SystemExit):
-        handle_stop(None, None)
+    # Timeout
+    print(f"\n⚠️ Server mungkin jalan tapi tunnel belum ready")
+    print(f"   Cek log: cat {LOG_FILE}")
+    print(f"   Cek status: moccha status")
 
 
-def stop_daemon():
-    """Stop background server."""
-    if not os.path.exists(PID_FILE):
-        return False
+def cmd_stop(args):
+    """Stop the server."""
+    if not is_running():
+        print("🔴 Server is not running")
+        return
 
-    try:
-        with open(PID_FILE) as f:
-            pid = int(f.read().strip())
-        os.kill(pid, signal.SIGTERM)
-        time.sleep(2)
-    except:
-        pass
-
-    for fpath in [PID_FILE, INFO_FILE]:
+    info = load_info()
+    if stop_daemon():
+        print("🛑 Server stopped")
+    else:
+        print("⚠️ Failed to stop server cleanly")
+        # Force kill
+        subprocess.run(["killall", "cloudflared"], capture_output=True)
         try:
-            os.remove(fpath)
+            os.remove(PID_FILE)
+            os.remove(INFO_FILE)
         except:
             pass
+        print("🧹 Cleaned up")
 
-    from .tunnel import stop_ngrok
-    stop_ngrok()
 
-    return True
+def cmd_status(args):
+    """Show server status."""
+    if is_running():
+        info = load_info()
+        if info:
+            print(f"🟢 RUNNING (PID: {info.get('pid')})")
+            print(f"   URL: {info.get('url')}")
+            print(f"   Key: {info.get('api_key')}")
+            print(f"   Tunnel: {info.get('tunnel', 'unknown')}")
+            print(f"   Started: {info.get('started')}")
+            print(f"   Workspace: {info.get('workspace')}")
+        else:
+            print("🟡 Process running but no info file")
+    else:
+        print("🔴 NOT RUNNING")
+
+
+def cmd_restart(args):
+    """Restart the server."""
+    print("🔄 Restarting...")
+    cmd_stop(args)
+    time.sleep(3)
+    cmd_start(args)
+
+
+def cmd_logs(args):
+    """Show logs."""
+    if os.path.exists(LOG_FILE):
+        lines = args.lines or 50
+        result = subprocess.run(
+            ["tail", "-n", str(lines), LOG_FILE],
+            capture_output=True, text=True
+        )
+        print(result.stdout)
+    else:
+        print("No log file found")
+
+
+def cmd_url(args):
+    """Show current URL."""
+    info = load_info()
+    if info and info.get("url"):
+        print(info["url"])
+    else:
+        print("No URL available. Server may not be running.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="moccha",
+        description="Moccha Server Manager"
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # start
+    p_start = sub.add_parser("start", help="Start server")
+    p_start.add_argument("--port", type=int, default=5000)
+    p_start.add_argument("--api-key", type=str, default=None)
+    p_start.add_argument("--workspace", type=str, default=None)
+    # ✅ ngrok-token tetap ada tapi opsional & diabaikan
+    p_start.add_argument("--ngrok-token", type=str, default=None,
+                         help="(deprecated, ignored - using cloudflared)")
+    p_start.set_defaults(func=cmd_start)
+
+    # stop
+    p_stop = sub.add_parser("stop", help="Stop server")
+    p_stop.set_defaults(func=cmd_stop)
+
+    # status
+    p_status = sub.add_parser("status", help="Show status")
+    p_status.set_defaults(func=cmd_status)
+
+    # restart
+    p_restart = sub.add_parser("restart", help="Restart server")
+    p_restart.add_argument("--port", type=int, default=5000)
+    p_restart.add_argument("--api-key", type=str, default=None)
+    p_restart.add_argument("--workspace", type=str, default=None)
+    p_restart.set_defaults(func=cmd_restart)
+
+    # logs
+    p_logs = sub.add_parser("logs", help="Show logs")
+    p_logs.add_argument("-n", "--lines", type=int, default=50)
+    p_logs.set_defaults(func=cmd_logs)
+
+    # url
+    p_url = sub.add_parser("url", help="Show current URL")
+    p_url.set_defaults(func=cmd_url)
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return
+
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
