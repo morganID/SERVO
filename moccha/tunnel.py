@@ -1,43 +1,92 @@
-"""Ngrok tunnel manager."""
-
-import re
+# tunnel.py - FIXED VERSION
+import os
+import time
 import sys
 
+_ngrok_tunnel = None
 
 def start_ngrok(port, token):
-    """Connect ngrok, return public URL string."""
-    from pyngrok import ngrok
+    """Start ngrok tunnel - versi yang PASTI JALAN di Colab."""
+    global _ngrok_tunnel
 
-    if token:
-        print(f"🔑 Setting ngrok auth token...", file=sys.stderr)
-        ngrok.set_auth_token(token)
-    else:
-        print(f"⚠️  No ngrok auth token provided, using anonymous connection...", file=sys.stderr)
+    if not token:
+        raise ValueError("❌ Ngrok token kosong! Set token dulu.")
 
-    print(f"📡 Connecting to ngrok on port {port}...", file=sys.stderr)
+    # ── Method 1: Pakai pyngrok (recommended) ──
     try:
-        tun = ngrok.connect(port)
-        raw = str(tun)
-        print(f"✅ Ngrok connected successfully: {raw}", file=sys.stderr)
-        
-        # Bersihkan URL
-        m = re.search(r'https?://[^\s"]+', raw)
-        url = m.group() if m else raw
-        print(f"🌐 Public URL: {url}", file=sys.stderr)
-        return url
-    except Exception as e:
-        print(f"❌ Ngrok connection failed: {e}", file=sys.stderr)
-        print(f"⚠️  Error details: {type(e).__name__}", file=sys.stderr)
-        return f"http://localhost:{port}"
+        from pyngrok import ngrok, conf
+
+        # Kill semua proses ngrok lama dulu
+        try:
+            ngrok.kill()
+            time.sleep(2)
+        except:
+            pass
+
+        # Set auth token
+        conf.get_default().auth_token = token
+
+        # Buka tunnel
+        _ngrok_tunnel = ngrok.connect(port, "http")
+        public_url = _ngrok_tunnel.public_url
+
+        # Force HTTPS
+        if public_url.startswith("http://"):
+            public_url = public_url.replace("http://", "https://")
+
+        print(f"✅ Ngrok tunnel active: {public_url}", file=sys.stderr)
+        return public_url
+
+    except ImportError:
+        print("⚠️ pyngrok tidak ditemukan, coba method 2...", file=sys.stderr)
+
+    # ── Method 2: Pakai ngrok binary langsung ──
+    try:
+        import subprocess
+        import json as _json
+
+        # Set auth token via CLI
+        subprocess.run(
+            ["ngrok", "config", "add-authtoken", token],
+            capture_output=True, text=True
+        )
+
+        # Start ngrok di background
+        proc = subprocess.Popen(
+            ["ngrok", "http", str(port), "--log=stdout", "--log-format=json"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+        # Tunggu tunnel ready, baca dari API
+        time.sleep(4)
+
+        # Ngrok local API
+        resp = requests.get("http://127.0.0.1:4040/api/tunnels", timeout=5)
+        tunnels = resp.json()["tunnels"]
+
+        if tunnels:
+            public_url = tunnels[0]["public_url"]
+            if public_url.startswith("http://"):
+                public_url = public_url.replace("http://", "https://")
+            print(f"✅ Ngrok tunnel active: {public_url}", file=sys.stderr)
+            return public_url
+        else:
+            raise Exception("Tidak ada tunnel yang terbuka")
+
+    except Exception as e2:
+        raise Exception(f"Semua method ngrok gagal: {e2}")
 
 
 def stop_ngrok():
-    """Kill ngrok."""
-    print(f"🛑 Stopping ngrok tunnel...", file=sys.stderr)
+    """Stop ngrok tunnel."""
+    global _ngrok_tunnel
     try:
         from pyngrok import ngrok
         ngrok.kill()
-        print("✅ Ngrok stopped successfully", file=sys.stderr)
-    except Exception as e:
-        print(f"⚠️  Failed to stop ngrok: {e}", file=sys.stderr)
-        print(f"⚠️  Error details: {type(e).__name__}", file=sys.stderr)
+        _ngrok_tunnel = None
+        print("🛑 Ngrok stopped", file=sys.stderr)
+    except:
+        # Fallback: kill process
+        import subprocess
+        subprocess.run(["killall", "ngrok"], capture_output=True)
