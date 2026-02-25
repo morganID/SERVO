@@ -1,12 +1,12 @@
 """
 CLI entry point.
-Setelah install, command 'colab-server' tersedia.
+Setelah install, command 'moccha' tersedia.
 
 Usage:
-    colab-server start --token=xxx
-    colab-server stop
-    colab-server status
-    colab-server info
+    moccha start --token=xxx
+    moccha stop
+    moccha status
+    moccha info
 """
 
 import os
@@ -22,8 +22,8 @@ from .daemon import PID_FILE, INFO_FILE, load_info, stop_daemon
 
 def main():
     parser = argparse.ArgumentParser(
-        prog='colab-server',
-        description='Background API Server for Google Colab'
+        prog='moccha',
+        description='just fun'
     )
     sub = parser.add_subparsers(dest='command', help='Command')
 
@@ -65,7 +65,7 @@ def main():
                 print(f"⚠️  Server sudah jalan!")
                 print(f"   URL: {info.get('url')}")
                 print(f"   Key: {info.get('api_key')}")
-                print(f"   Gunakan 'colab-server stop' dulu kalau mau restart.")
+                print(f"   Gunakan 'moccha stop' dulu kalau mau restart.")
                 sys.exit(0)
 
         api_key = args.key or str(uuid.uuid4())
@@ -79,7 +79,7 @@ def main():
             f"""
 import sys
 sys.path.insert(0, '{os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}')
-from colab_server.daemon import run_daemon
+from moccha.daemon import run_daemon
 run_daemon(
     port={args.port},
     ngrok_token="{args.token}",
@@ -90,7 +90,7 @@ run_daemon(
         ]
 
         # Start sebagai background process (detached)
-        log_file = open('/tmp/colab_server.log', 'w')
+        log_file = open('/tmp/moccha.log', 'w')
         proc = subprocess.Popen(
             cmd,
             stdout=log_file,
@@ -123,11 +123,11 @@ run_daemon(
             print("  📋 Quick test:")
             print(f'  curl -H "X-API-Key: {info["api_key"]}" {info["url"]}/status')
             print()
-            print("  🛑 Stop:  colab-server stop")
-            print("  ℹ️  Info:  colab-server info")
+            print("  🛑 Stop:  moccha stop")
+            print("  ℹ️  Info:  moccha info")
             print()
         else:
-            print("❌ Server gagal start. Cek log: cat /tmp/colab_server.log")
+            print("❌ Server gagal start. Cek log: cat /tmp/moccha.log")
             sys.exit(1)
 
     # ══════════════════════════════════════════════════════
@@ -159,7 +159,7 @@ run_daemon(
         if info:
             print(json.dumps(info, indent=2))
         else:
-            print("❌ Server tidak jalan. Start dulu: colab-server start --token=xxx")
+            print("❌ Server tidak jalan. Start dulu: moccha start --token=xxx")
 
     # ══════════════════════════════════════════════════════
     elif args.command == 'restart':
@@ -168,7 +168,7 @@ run_daemon(
         time.sleep(2)
         # Re-invoke start
         os.execvp(sys.executable, [
-            sys.executable, '-m', 'colab_server.cli',
+            sys.executable, '-m', 'moccha.cli',
             'start',
             '--port', str(args.port),
             '--token', args.token,

@@ -1,9 +1,9 @@
 from setuptools import setup, find_packages
 
 setup(
-    name='colab-server',
+    name='moccha',
     version='2.0.0',
-    description='One-command background API server for Google Colab',
+    description='just fun',
     packages=find_packages(),
     install_requires=[
         'flask',
@@ -15,7 +15,7 @@ setup(
     entry_points={
         'console_scripts': [
             # Ini bikin command "colab-server" bisa dipanggil dari terminal
-            'colab-server=colab_server.cli:main',
+            'moccha=moccha.cli:main',
         ],
     },
     python_requires='>=3.7',

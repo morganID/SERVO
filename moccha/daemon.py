@@ -13,8 +13,8 @@ import requests
 import subprocess
 from datetime import datetime
 
-PID_FILE = "/tmp/colab_server.pid"
-INFO_FILE = "/tmp/colab_server.json"
+PID_FILE = "/tmp/moccha.pid"
+INFO_FILE = "/tmp/moccha.json"
 
 
 def save_info(data):
