@@ -83,11 +83,8 @@ run_daemon(
         log.close()                        # parent lepas file handle
 
         # LANGSUNG PRINT & RETURN — ZERO SLEEP
-        print("🚀 Server spawned di background!")
-        print(f"   🔑 Key: {api_key}")
-        print()
-        print("   ⏳ Tunggu ~10 detik lalu cek:")
-        print("   → !moccha info")
+        print("🚀 Flying to the moon!")
+     
         return  # ← CELL LANGSUNG SELESAI
 
     # ══════════════════════════════════════════════════════
