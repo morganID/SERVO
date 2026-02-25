@@ -7,8 +7,17 @@ from typing import Dict, Any, Optional, List
 from pathlib import Path
 
 from .deluge_service import DelugeService
-from .jdownloader_service import JDownloaderService
-from .mega_service import MegaService
+
+# Optional imports for future services
+try:
+    from .jdownloader_service import JDownloaderService
+except ImportError:
+    JDownloaderService = None
+
+try:
+    from .mega_service import MegaService
+except ImportError:
+    MegaService = None
 
 logger = logging.getLogger(__name__)
 

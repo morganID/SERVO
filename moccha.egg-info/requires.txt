@@ -1,0 +1,6 @@
+flask
+flask-cors
+pyngrok
+psutil
+requests
+deluge-client

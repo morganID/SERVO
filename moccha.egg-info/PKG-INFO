@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: moccha
+Version: 2.0.0
+Summary: just fun
+Requires-Python: >=3.7
+Requires-Dist: flask
+Requires-Dist: flask-cors
+Requires-Dist: pyngrok
+Requires-Dist: psutil
+Requires-Dist: requests
+Requires-Dist: deluge-client
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
