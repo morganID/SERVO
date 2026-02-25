@@ -1,10 +1,9 @@
 """
-Daemon entry point - dipanggil oleh CLI sebagai subprocess.
-Run with: python -m moccha.daemon_entry
+Daemon entry point.
+Run: python -m moccha.daemon_entry --port 5000 --api-key KEY --workspace DIR
 """
 
 import argparse
-import sys
 
 
 def main():
@@ -23,5 +22,6 @@ def main():
     )
 
 
+# ✅ Ini yang dipanggil oleh: python -m moccha.daemon_entry
 if __name__ == "__main__":
     main()

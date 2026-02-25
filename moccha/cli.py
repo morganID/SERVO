@@ -1,17 +1,15 @@
-"""CLI entry point."""
+"""CLI entry point - NON-BLOCKING."""
 
 import os
 import sys
 import json
 import time
-import signal
 import argparse
 import subprocess
 import secrets
 
-# ✅ FIX: Import langsung dari module, BUKAN relative
 from moccha.daemon import (
-    run_daemon, stop_daemon, is_running,
+    stop_daemon, is_running,
     load_info, PID_FILE, INFO_FILE, LOG_FILE
 )
 
@@ -28,6 +26,7 @@ def cmd_start(args):
             print(f"   URL: {info.get('url')}")
             print(f"   Key: {info.get('api_key')}")
             return
+
         print("⚠️ Stale PID file, cleaning up...")
         try:
             os.remove(PID_FILE)
@@ -39,46 +38,54 @@ def cmd_start(args):
     workspace = args.workspace or os.path.expanduser("~/moccha_workspace")
     os.makedirs(workspace, exist_ok=True)
 
+    # Bersihkan log lama
+    try:
+        open(LOG_FILE, 'w').close()
+    except:
+        pass
+
     print(f"🚀 Starting server...")
     print(f"   Port: {port}")
     print(f"   Workspace: {workspace}")
-    print(f"   Tunnel: cloudflared (free)")
 
-    log_f = open(LOG_FILE, 'a')
-
-    proc = subprocess.Popen(
-        [
-            sys.executable, "-m", "moccha.daemon_entry",
-            "--port", str(port),
-            "--api-key", api_key,
-            "--workspace", workspace,
-        ],
-        stdout=subprocess.PIPE,
-        stderr=log_f,
-        env=os.environ.copy(),
-        start_new_session=True,
+    # ✅ FIX: Launch daemon FULLY DETACHED
+    #    nohup + redirect semua output + start_new_session
+    cmd = (
+        f'nohup {sys.executable} -m moccha.daemon_entry '
+        f'--port {port} '
+        f'--api-key {api_key} '
+        f'--workspace {workspace} '
+        f'>> {LOG_FILE} 2>&1 &'
     )
 
-    print("⏳ Waiting for server...")
+    os.system(cmd)
 
-    for i in range(30):
-        time.sleep(2)
+    # ✅ FIX: Tunggu SINGKAT saja (max 15 detik), bukan 60 detik
+    print("⏳ Waiting for tunnel...")
+
+    for i in range(15):
+        time.sleep(1)
         info = load_info()
-        if info and info.get("url"):
-            url = info["url"]
+        if info and info.get("url") and "localhost" not in info["url"]:
             print(f"\n{'='*55}")
             print(f"  🟢 Server is running!")
-            print(f"  🌐 URL: {url}")
+            print(f"  🌐 URL: {info['url']}")
             print(f"  🔑 Key: {api_key}")
             print(f"  📂 Workspace: {workspace}")
             print(f"{'='*55}")
-
-            if "localhost" in url:
-                print(f"\n  ⚠️ Tunnel not active yet, check:")
-                print(f"     !cat {LOG_FILE}")
             return
 
-    print(f"\n⚠️ Timeout. Check: !cat {LOG_FILE}")
+    # Belum ready tapi proses sudah jalan di background
+    info = load_info()
+    if info:
+        print(f"\n🟡 Server starting (tunnel may still be connecting)")
+        print(f"   URL so far: {info.get('url', 'pending...')}")
+        print(f"   Key: {api_key}")
+        print(f"\n   Check status: !moccha status")
+        print(f"   Check logs:   !moccha logs")
+    else:
+        print(f"\n⚠️ Server may have failed to start")
+        print(f"   Check: !cat {LOG_FILE}")
 
 
 def cmd_stop(args):
